@@ -25,6 +25,7 @@
   var SHOWN_KEY = 'dshSkillUpdater.shown';
 
   var POLL_MS = 700;
+  var REQUEST_TIMEOUT_MS = 10000;              /* 单个控制请求的上限:宿主不回应时不能一直等 */
   var MAX_STATUS_FAILURES = 5;                 /* 连续失败次数上限 */
   var STATUS_WATCHDOG_MS = 10 * 60 * 1000;     /* 宿主长期停在 checking 的兜底上限 */
   var MAX_JOB_POLLS = 800;
@@ -34,7 +35,7 @@
     root: null,
     status: null,
     view: 'list',          // 'list' | 'progress' | 'done'
-    selected: {},          // id -> boolean (true = checked)
+    selected: Object.create(null),   // id -> boolean (true = checked);无原型,避免 "__proto__" 之类的 id
     closed: false,         // 用户本次会话是否主动关闭过面板
     modalOpen: false,
     skippedOpen: false,
@@ -58,6 +59,7 @@
     sub: null,
     body: null,
     foot: null,
+    live: null,
     primary: null
   };
 
@@ -188,6 +190,11 @@
 }
 #dsh-skill-updater-root .dsuc-empty{padding:22px 18px;font-size:12.5px;color:var(--dsuc-dim);}
 #dsh-skill-updater-root .dsuc-empty-err{color:var(--dsuc-err);word-break:break-word;}
+/* 供读屏软件播报的状态区(视觉上隐藏) */
+#dsh-skill-updater-root .dsuc-sr{
+  position:absolute;width:1px;height:1px;margin:-1px;padding:0;
+  overflow:hidden;clip:rect(0 0 0 0);clip-path:inset(50%);white-space:nowrap;border:0;
+}
 
 /* ---------- rows ---------- */
 #dsh-skill-updater-root .dsuc-row{
@@ -431,6 +438,9 @@
    * HTTP
    * ------------------------------------------------------------------ */
 
+  /* 控制请求必须有上限:宿主不回应(hang)时,超时要和请求失败一样落到 error 状态,
+   * 否则面板会一直卡在 checking 且「重新检查」不可点。
+   * 用 AbortController + setTimeout(ES2017 兼容,不用 AbortSignal.timeout)。 */
   function httpJson(method, url, body) {
     var opts = {
       method: method,
@@ -443,7 +453,38 @@
       opts.body = JSON.stringify(body);
     }
 
-    return fetch(url, opts).then(function (res) {
+    var timer = null;
+    var timedOut = false;
+    try {
+      if (typeof AbortController === 'function') {
+        var controller = new AbortController();
+        opts.signal = controller.signal;
+        timer = setTimeout(function () {
+          timedOut = true;
+          try { controller.abort(); } catch (e) { /* ignore */ }
+        }, REQUEST_TIMEOUT_MS);
+      }
+    } catch (e) {
+      timer = null;
+    }
+
+    function clearTimer() {
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
+    }
+
+    var request;
+    try {
+      request = fetch(url, opts);
+    } catch (err) {
+      /* 同步失败(例如没有 fetch):清掉计时器后原样抛出,调用方照旧同步捕获。 */
+      clearTimer();
+      throw err;
+    }
+
+    return request.then(function (res) {
       return res.text().then(function (text) {
         var data = null;
         if (text) {
@@ -457,8 +498,15 @@
         return data;
       });
     }, function (err) {
+      if (timedOut) { throw new Error('请求超时（超过 ' + (REQUEST_TIMEOUT_MS / 1000) + ' 秒）'); }
       var reason = (err && err.message) ? err.message : '未知原因';
       throw new Error('网络请求失败（' + reason + '）');
+    }).then(function (data) {
+      clearTimer();
+      return data;
+    }, function (err) {
+      clearTimer();
+      throw err;
     });
   }
 
@@ -486,9 +534,10 @@
 
   function normalizeStatus(raw) {
     var st = (raw && typeof raw === 'object') ? raw : {};
+    /* items 和 entries 用同一套归一化,坏数据不会变成「有 N 项可更新」却渲染不出行。 */
     var items = Array.isArray(st.items) ? st.items.filter(function (i) {
-      return i && i.id && i.hasUpdate !== false;
-    }) : [];
+      return i && typeof i === 'object' && i.id && i.hasUpdate !== false;
+    }).map(normalizeEntry) : [];
     /* Older hosts do not send `entries`; fall back to an empty inventory. */
     var entries = Array.isArray(st.entries) ? st.entries.filter(function (e) {
       return e && typeof e === 'object' && (e.id || e.name);
@@ -504,9 +553,8 @@
       skipped: Array.isArray(st.skipped) ? st.skipped : [],
       entries: entries
     };
-    out.updateCount = (typeof st.updateCount === 'number')
-      ? st.updateCount
-      : out.items.length;
+    /* 计数只认真正会渲染出来的行,宿主自报的 updateCount 不再参与判断。 */
+    out.updateCount = out.items.length;
     if (st.ok === false) { out.phase = 'error'; }
     if (out.phase === 'error' && !out.error) { out.error = '检查更新时发生未知错误。'; }
     return out;
@@ -546,11 +594,9 @@
     });
   }
 
+  /* 只数真正会渲染成勾选行的项,保证标题/底栏/正文永远一致。 */
   function countItems(st) {
-    if (!st) { return 0; }
-    var items = getItems(st);
-    if (items.length) { return items.length; }
-    return (typeof st.updateCount === 'number' && st.updateCount > 0) ? st.updateCount : 0;
+    return getItems(st).length;
   }
 
   function seedSelection(st) {
@@ -648,6 +694,13 @@
     var foot = el('div', 'dsuc-foot');
     modal.appendChild(foot);
 
+    /* 读屏播报区:进度 / 结果 / 错误只在这里更新,避免整块正文反复被念。 */
+    var live = el('div', 'dsuc-sr');
+    live.setAttribute('role', 'status');
+    live.setAttribute('aria-live', 'polite');
+    live.setAttribute('aria-atomic', 'true');
+    modal.appendChild(live);
+
     backdrop.appendChild(modal);
     backdrop.addEventListener('click', safely(function (ev) {
       if (ev.target === backdrop) { closeModal(true); }
@@ -660,6 +713,7 @@
     ui.sub = sub;
     ui.body = body;
     ui.foot = foot;
+    ui.live = live;
     ui.primary = null;
   }
 
@@ -744,9 +798,39 @@
       renderHead();
       renderBody();
       renderFoot();
+      renderLive();
     } catch (err) {
       try { console.error('[dsh-skill-updater]', err); } catch (e) { /* ignore */ }
     }
+  }
+
+  /* 把当前状态压缩成一句话给读屏软件(视觉上隐藏,不重复正文)。 */
+  function renderLive() {
+    if (!ui.live) { return; }
+    var text = '';
+    if (state.view === 'progress') {
+      var steps = (state.job && Array.isArray(state.job.steps)) ? state.job.steps : [];
+      if (!steps.length) {
+        text = '正在应用更新';
+      } else {
+        var settled = 0;
+        steps.forEach(function (s) {
+          if (s && (s.status === 'ok' || s.status === 'failed' || s.status === 'skipped')) { settled++; }
+        });
+        text = '正在应用更新：已完成 ' + settled + '/' + steps.length + ' 项';
+      }
+    } else if (state.view === 'done') {
+      var sum = state.summary || { ok: 0, failed: 0 };
+      text = '已更新 ' + sum.ok + ' 项，' + sum.failed + ' 项失败';
+    } else {
+      var st = state.status || {};
+      if (st.phase === 'checking') {
+        text = '正在检查更新';
+      } else if (st.phase === 'error') {
+        text = st.error ? String(st.error) : '检查更新失败';
+      }
+    }
+    ui.live.textContent = text;
   }
 
   function renderHead() {
@@ -835,12 +919,10 @@
       return wrap;
     }
 
+    /* 这里是「没有可更新项」的视图:一律渲染成清单行,不放勾选框,
+     * 免得坏数据在绿色横幅里画出无法提交的复选框。 */
     sortEntries(entries).forEach(function (entry) {
-      if (entry.status === 'update') {
-        wrap.appendChild(buildRow(entry));
-      } else {
-        wrap.appendChild(buildEntryRow(entry));
-      }
+      wrap.appendChild(buildEntryRow(entry));
     });
     return wrap;
   }
@@ -876,6 +958,10 @@
     if (entry.status === 'skipped') {
       line.appendChild(el('span', 'dsuc-mark dsuc-mark-skip', '— 已跳过'));
       line.appendChild(versionSpan(entry.installed, null));
+    } else if (entry.status === 'update') {
+      /* 理论上进不了清单视图(有 update 项就会走更新列表),坏数据下如实标注。 */
+      line.appendChild(el('span', 'dsuc-mark dsuc-mark-ok', '↑ 有可用更新'));
+      line.appendChild(versionSpan(entry.installed, entry.available));
     } else {
       line.appendChild(el('span', 'dsuc-mark dsuc-mark-ok', '✓ 已是最新'));
       line.appendChild(versionSpan(entry.installed, entry.available));
@@ -1008,7 +1094,49 @@
     appendLog(ui.body, state.job);
   }
 
+  /* 页脚每次重建都会丢焦点:渲染前记住焦点在哪个按钮上(按 data-dsuc 标记),
+   * 渲染后把焦点还回去;按钮文字会变(例如「更新选中 (2)」),所以不能用文字匹配。 */
+  function focusedFootKey() {
+    try {
+      var active = document.activeElement;
+      if (!active || !ui.foot || !active.getAttribute) { return null; }
+      if (String(active.tagName || '').toUpperCase() !== 'BUTTON') { return null; }
+      var key = active.getAttribute('data-dsuc');
+      if (!key) { return null; }
+      for (var p = active.parentNode; p; p = p.parentNode) {
+        if (p === ui.foot) { return key; }
+      }
+      return null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function findFootButton(node, key) {
+    if (!node) { return null; }
+    for (var i = 0; i < node.children.length; i++) {
+      var child = node.children[i];
+      if (String(child.tagName || '').toUpperCase() === 'BUTTON' && child.getAttribute &&
+          child.getAttribute('data-dsuc') === key) {
+        return child;
+      }
+      var hit = findFootButton(child, key);
+      if (hit) { return hit; }
+    }
+    return null;
+  }
+
   function renderFoot() {
+    var focusKey = focusedFootKey();
+    buildFoot();
+    if (!focusKey) { return; }
+    var again = findFootButton(ui.foot, focusKey);
+    if (again && !again.disabled) {
+      try { again.focus(); } catch (e) { /* ignore */ }
+    }
+  }
+
+  function buildFoot() {
     clear(ui.foot);
     ui.primary = null;
 
@@ -1024,6 +1152,7 @@
     if (state.view === 'done') {
       var closeBtn = el('button', 'dsuc-btn dsuc-btn-primary', '关闭');
       closeBtn.type = 'button';
+      closeBtn.setAttribute('data-dsuc', 'close');
       closeBtn.addEventListener('click', safely(function () { closeModal(true); }));
       ui.foot.appendChild(closeBtn);
       ui.primary = closeBtn;
@@ -1037,6 +1166,7 @@
 
     var recheck = el('button', 'dsuc-btn', '重新检查');
     recheck.type = 'button';
+    recheck.setAttribute('data-dsuc', 'recheck');
     recheck.disabled = st.phase === 'checking';
     recheck.addEventListener('click', safely(function () { onRecheck(); }));
 
@@ -1044,6 +1174,7 @@
     if (ready && pending === 0) {
       var done = el('button', 'dsuc-btn dsuc-btn-plain', '关闭');
       done.type = 'button';
+      done.setAttribute('data-dsuc', 'close');
       done.addEventListener('click', safely(function () { closeModal(true); }));
       ui.foot.appendChild(recheck);
       ui.foot.appendChild(done);
@@ -1052,11 +1183,13 @@
 
     var primary = el('button', 'dsuc-btn dsuc-btn-primary', '更新选中 (' + picked + ')');
     primary.type = 'button';
+    primary.setAttribute('data-dsuc', 'primary');
     primary.disabled = !ready || picked === 0;
     primary.addEventListener('click', safely(function () { onApply(); }));
 
     var later = el('button', 'dsuc-btn dsuc-btn-plain', '稍后');
     later.type = 'button';
+    later.setAttribute('data-dsuc', 'later');
     later.addEventListener('click', safely(function () { closeModal(true); }));
 
     ui.foot.appendChild(primary);
@@ -1198,7 +1331,7 @@
       /* Refresh status so the list reflects reality after the run. */
       return httpJson('GET', BASE + '/status.json').then(function (data) {
         state.status = normalizeStatus(data);
-        state.selected = {};
+        state.selected = Object.create(null);
         seedSelection(state.status);
       }).catch(function () { /* keep the previous status */ });
     } catch (err) {
@@ -1295,7 +1428,7 @@
     try {
       var st = normalizeStatus(raw);
       state.status = st;
-      state.selected = {};
+      state.selected = Object.create(null);
       seedSelection(st);
 
       if (st.phase === 'checking') {
