@@ -1,0 +1,15 @@
+# ============================================================================
+# dsh-plugin-skill-updater —— DSH bundle patch
+# ============================================================================
+# 宿主侧插件挂载声明。DSH 启动时按 bundle 层栈叠加各插件 patch,本文件把
+# 「更新中心」插入当前 profile 的配置树(宿主路由 + Web 端弹窗)。
+#
+# 安装(本地开发,link 方式,改完刷新页面/重启 DSH 即生效):
+#   dsh plugin --profile desktop add link:<本目录绝对路径>
+# 卸载:
+#   dsh plugin --profile desktop remove dsh-plugin-skill-updater
+# ============================================================================
+
+- insert:
+    - id: dsh-plugin-skill-updater
+      name: dsh-plugin-skill-updater
