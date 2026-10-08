@@ -1,11 +1,7 @@
 /*!
  * dsh-plugin-skill-updater / assets/skill-updater.js
- * Popup UI for the DSH Update Center plugin.
- *
- * Classic browser script: plain IIFE, no imports/exports, no JSX, no bundler,
- * no external libraries, no TypeScript. ES2017-compatible (Chromium ~130).
- * Injected by the host as a classic <script> on both the Electron client and
- * a normal browser page. UTF-8, no BOM.
+ * 弹窗 UI:宿主以经典 <script> 注入 Electron 客户端与普通页面。
+ * 纯 IIFE,无模块、无打包器、无依赖;ES2017(Chromium ~130),UTF-8 无 BOM。
  */
 (function () {
   'use strict';
@@ -27,7 +23,7 @@
   var POLL_MS = 700;
   var REQUEST_TIMEOUT_MS = 10000;              /* 单个控制请求的上限:宿主不回应时不能一直等 */
   var MAX_STATUS_FAILURES = 5;                 /* 连续失败次数上限 */
-  var STATUS_WATCHDOG_MS = 10 * 60 * 1000;     /* 宿主长期停在 checking 的兜底上限 */
+  var STATUS_WATCHDOG_MS = 10 * 60 * 1000;     /* 宿主停在 checking 的兜底上限 */
   var MAX_JOB_POLLS = 800;
   var MAX_LOG_LINES = 200;
 
@@ -35,7 +31,7 @@
     root: null,
     status: null,
     view: 'list',          // 'list' | 'progress' | 'done'
-    selected: Object.create(null),   // id -> boolean (true = checked);无原型,避免 "__proto__" 之类的 id
+    selected: Object.create(null),   // id -> boolean (true = checked);无原型,避免 "__proto__" 这类 id
     closed: false,         // 用户本次会话是否主动关闭过面板
     modalOpen: false,
     skippedOpen: false,
@@ -46,7 +42,7 @@
     applying: false,
     statusTimer: null,
     statusFailures: 0,     // 连续失败次数
-    statusSince: 0,        // 本轮轮询开始时间(看门狗基准)
+    statusSince: 0,        // 本轮轮询起点(看门狗基准)
     jobTimer: null,
     jobPolls: 0,
     prevFocus: null
@@ -416,8 +412,8 @@
    * ------------------------------------------------------------------ */
 
   /* "本会话已经自动弹过面板" / "用户本会话主动关闭过面板"。
-   * DSH 重启或重开桌面端会开始新的浏览器会话,所以面板每次启动弹一次;
-   * 普通 F5 保留同一个 sessionStorage,所以不会反复打扰。 */
+   * DSH 重启或重开桌面端是新的浏览器会话,所以每次启动弹一次;
+   * 普通 F5 保留同一个 sessionStorage,不会反复打扰。 */
   function readShown() {
     try { return sessionStorage.getItem(SHOWN_KEY) === '1'; } catch (e) { return false; }
   }
@@ -534,7 +530,7 @@
 
   function normalizeStatus(raw) {
     var st = (raw && typeof raw === 'object') ? raw : {};
-    /* items 和 entries 用同一套归一化,坏数据不会变成「有 N 项可更新」却渲染不出行。 */
+    /* items 和 entries 同一套归一化,坏数据不会变成「有 N 项可更新」却渲染不出行。 */
     var items = Array.isArray(st.items) ? st.items.filter(function (i) {
       return i && typeof i === 'object' && i.id && i.hasUpdate !== false;
     }).map(normalizeEntry) : [];
@@ -638,7 +634,7 @@
       if (root.__dshSkillUpdater) { return root; }
       if (root.parentNode) { root.parentNode.removeChild(root); }
     }
-    /* document.body 还没出现:交给 boot() 重试,这里不抛错。 */
+    /* 没有 document.body:交给 boot() 重试,这里不抛错。 */
     if (!document.body) { return null; }
     root = document.createElement('div');
     root.id = ROOT_ID;
@@ -654,7 +650,7 @@
     /* 仍然没有 body:静默返回,open() 不会因此抛错。 */
     if (!root) { return; }
 
-    /* 上一次注入脚本如果中途失败,root 里可能留着一个孤儿 backdrop:先清掉。 */
+    /* 上一次注入脚本中途失败时,root 里可能留下孤儿 backdrop:先清掉。 */
     for (var i = root.children.length - 1; i >= 0; i--) {
       var orphan = root.children[i];
       if (orphan && String(orphan.className).indexOf('dsuc-backdrop') !== -1) {
@@ -719,10 +715,8 @@
 
   /* ------------------------------------------------------------------ *
    * Pill —— 已按需求移除
-   * 左下角那个「更新中心 / N 项可更新」胶囊会和 DSH 桌面端自带的「更多」控件重叠,
-   * 所以这里不再创建任何 DOM,也不再保留任何胶囊状态。
-   * 面板本身每次启动会自动弹出一次;关闭后本次会话不再自动弹出,
-   * 需要时可用 dshSkillUpdater.open() 重新打开。
+   * 左下角「更新中心 / N 项可更新」胶囊与 DSH 桌面端自带的「更多」控件重叠,
+   * 所以这里不再创建 DOM,也不保留任何胶囊状态;入口见 dshSkillUpdater.open()。
    * ------------------------------------------------------------------ */
 
   /* ------------------------------------------------------------------ *
@@ -769,7 +763,7 @@
       document.removeEventListener('keydown', onKeyDown, true);
 
       /* 用户主动关闭(稍后 / × / Esc / 点背景):本次会话不再自动弹出,
-       * 无论当时处于哪个阶段 —— 正处于 checking 时更要记下来。 */
+       * 无论当时处于哪个阶段,正处于 checking 时更要记下来。 */
       if (recordDismiss !== false) {
         state.closed = true;
         writeClosed();
@@ -1094,8 +1088,8 @@
     appendLog(ui.body, state.job);
   }
 
-  /* 页脚每次重建都会丢焦点:渲染前记住焦点在哪个按钮上(按 data-dsuc 标记),
-   * 渲染后把焦点还回去;按钮文字会变(例如「更新选中 (2)」),所以不能用文字匹配。 */
+  /* 页脚每次重建都会丢焦点:渲染前记下焦点按钮(按 data-dsuc 标记),渲染后还回去;
+   * 按钮文字会变(例如「更新选中 (2)」),不能用文字匹配。 */
   function focusedFootKey() {
     try {
       var active = document.activeElement;
@@ -1213,7 +1207,7 @@
       state.statusFailures = 0;
       applyStatus(data);
     }).catch(function (err) {
-      /* 失败也要回到可用状态:直接进入 error 阶段,「重新检查」立刻可以再点。 */
+      /* 失败也要回到可用状态:直接进 error 阶段,「重新检查」立刻能再点。 */
       applyStatus({ ok: false, phase: 'error', error: friendlyError(err, '重新检查失败') });
     });
   }
@@ -1223,7 +1217,7 @@
     var ids = selectedIds();
     if (!ids.length) { return; }
 
-    /* httpJson 会在同步阶段调用 fetch,所以先建 promise:它抛错时不能先切到进度视图,
+    /* httpJson 在同步阶段就调用 fetch,所以先建 promise:它抛错时不能先切到进度视图,
      * 否则面板会卡在一个关不掉、也没有轮询的 progress 视图里。 */
     var request;
     try {
@@ -1344,10 +1338,9 @@
    * Status loading & polling
    * ------------------------------------------------------------------ */
 
-  /* 宿主检查更新要走网络,可能长时间停在 checking(10s+ 甚至更久),
-   * 所以「成功返回 checking」不计入上限;只有连续请求失败才计数。
-   * 另外用 10 分钟看门狗兜底「宿主永远停在 checking」。
-   * 无论哪条路径触发,都会落到可见的 error 状态,绝不静默停止轮询。 */
+  /* 成功返回 checking 不计入失败上限(宿主检查要走网络,可能停在 checking 很久),
+   * 只有连续请求失败才计数;另有 10 分钟看门狗兜底。
+   * 哪条路径触发都落到可见的 error 状态,绝不静默停止轮询。 */
   function statusTick() {
     if (state.statusSince && (Date.now() - state.statusSince) > STATUS_WATCHDOG_MS) {
       tripStatusError('检查更新耗时过长（超过 10 分钟），已停止自动刷新。可点「重新检查」重试。');
@@ -1386,13 +1379,7 @@
     applyStatus(Object.assign({}, state.status || {}, { ok: false, phase: 'error', error: message }));
   }
 
-  /* Ready: show the update list, or — once per browser session — the full
-   * inventory even when nothing needs updating.
-   *
-   * Rationale: a DSH restart / reopening the desktop client starts a fresh
-   * browser session, so the panel shows once per launch; a plain F5 keeps the
-   * same sessionStorage, so it does not nag on every refresh.
-   * 用户主动关闭过面板之后,本次会话一律不再自动弹出。 */
+  /* 用户主动关闭过面板之后,本次会话不再自动弹出(sessionStorage 语义见 Storage)。 */
   function handleReady(st) {
     if (state.closed || readClosed()) { return; }
     if (state.modalOpen) { return; }

@@ -2,7 +2,7 @@
   "name": "dsh-plugin-skill-updater",
   "version": "1.0.0",
   "private": true,
-  "description": "DSH 启动时自动检查已安装插件与 Skill 的更新,并在 Web 界面弹窗列出「当前版本 → 最新版本」,由用户确认后更新。",
+  "description": "DSH 启动时检查已安装插件与 Skill 的更新,弹窗列出「当前版本 → 最新版本」,确认后更新。",
   "keywords": [
     "dsh",
     "dsh-plugin",
