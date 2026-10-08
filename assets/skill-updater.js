@@ -21,11 +21,12 @@
   var BASE = '/dsh-plugin-skill-updater';
   var STYLE_ID = 'dsh-skill-updater-style';
   var ROOT_ID = 'dsh-skill-updater-root';
-  var DISMISS_KEY = 'dshSkillUpdater.dismissed';
+  var CLOSED_KEY = 'dshSkillUpdater.closed';
   var SHOWN_KEY = 'dshSkillUpdater.shown';
 
   var POLL_MS = 700;
-  var MAX_STATUS_POLLS = 60;
+  var MAX_STATUS_FAILURES = 5;                 /* 连续失败次数上限 */
+  var STATUS_WATCHDOG_MS = 10 * 60 * 1000;     /* 宿主长期停在 checking 的兜底上限 */
   var MAX_JOB_POLLS = 800;
   var MAX_LOG_LINES = 200;
 
@@ -34,17 +35,17 @@
     status: null,
     view: 'list',          // 'list' | 'progress' | 'done'
     selected: {},          // id -> boolean (true = checked)
-    dismissedSig: null,
+    closed: false,         // 用户本次会话是否主动关闭过面板
     modalOpen: false,
     skippedOpen: false,
     logOpen: false,
     inlineError: null,
     summary: null,
     job: null,
-    jobId: null,
     applying: false,
     statusTimer: null,
-    statusPolls: 0,
+    statusFailures: 0,     // 连续失败次数
+    statusSince: 0,        // 本轮轮询开始时间(看门狗基准)
     jobTimer: null,
     jobPolls: 0,
     prevFocus: null
@@ -60,9 +61,6 @@
     primary: null
   };
 
-  var pillEl = null;
-  var pillKind = null;
-  var pillCount = -1;
   var loggedOnce = {};
 
   /* ------------------------------------------------------------------ *
@@ -86,8 +84,7 @@
     '--dsuc-warn: #e8b339;',
     '--dsuc-warn-bg: rgba(232,179,57,.14);',
     '--dsuc-warn-border: rgba(232,179,57,.45);',
-    '--dsuc-shadow: 0 24px 64px rgba(0,0,0,.45);',
-    '--dsuc-shadow-pill: 0 6px 20px rgba(0,0,0,.35);'
+    '--dsuc-shadow: 0 24px 64px rgba(0,0,0,.45);'
   ].join(' ');
 
   var LIGHT_VARS = [
@@ -107,8 +104,7 @@
     '--dsuc-warn: #9a6700;',
     '--dsuc-warn-bg: rgba(212,167,44,.16);',
     '--dsuc-warn-border: rgba(154,103,0,.35);',
-    '--dsuc-shadow: 0 18px 48px rgba(15,20,30,.18);',
-    '--dsuc-shadow-pill: 0 6px 18px rgba(15,20,30,.16);'
+    '--dsuc-shadow: 0 18px 48px rgba(15,20,30,.18);'
   ].join(' ');
 
   var CSS = `
@@ -412,24 +408,23 @@
    * Storage
    * ------------------------------------------------------------------ */
 
-  function readDismissed() {
-    try { return sessionStorage.getItem(DISMISS_KEY) || null; } catch (e) { return null; }
-  }
-
-  function writeDismissed(sig) {
-    try { sessionStorage.setItem(DISMISS_KEY, sig); } catch (e) { /* ignore */ }
-  }
-
-  /* "the panel has already been shown once in this browser session".
-   * A DSH restart / reopening the desktop client starts a fresh browser
-   * session, so the panel shows once per launch; a plain F5 keeps the same
-   * sessionStorage, so it does not nag on every refresh. */
+  /* "本会话已经自动弹过面板" / "用户本会话主动关闭过面板"。
+   * DSH 重启或重开桌面端会开始新的浏览器会话,所以面板每次启动弹一次;
+   * 普通 F5 保留同一个 sessionStorage,所以不会反复打扰。 */
   function readShown() {
     try { return sessionStorage.getItem(SHOWN_KEY) === '1'; } catch (e) { return false; }
   }
 
   function writeShown() {
     try { sessionStorage.setItem(SHOWN_KEY, '1'); } catch (e) { /* ignore */ }
+  }
+
+  function readClosed() {
+    try { return sessionStorage.getItem(CLOSED_KEY) === '1'; } catch (e) { return false; }
+  }
+
+  function writeClosed() {
+    try { sessionStorage.setItem(CLOSED_KEY, '1'); } catch (e) { /* ignore */ }
   }
 
   /* ------------------------------------------------------------------ *
@@ -558,10 +553,6 @@
     return (typeof st.updateCount === 'number' && st.updateCount > 0) ? st.updateCount : 0;
   }
 
-  function signature(st) {
-    return countItems(st) + '|' + ((st && st.checkedAt) ? st.checkedAt : '');
-  }
-
   function seedSelection(st) {
     getItems(st).forEach(function (item) {
       if (state.selected[item.id] === undefined) { state.selected[item.id] = true; }
@@ -601,6 +592,8 @@
       if (root.__dshSkillUpdater) { return root; }
       if (root.parentNode) { root.parentNode.removeChild(root); }
     }
+    /* document.body 还没出现:交给 boot() 重试,这里不抛错。 */
+    if (!document.body) { return null; }
     root = document.createElement('div');
     root.id = ROOT_ID;
     root.__dshSkillUpdater = true;
@@ -610,7 +603,18 @@
 
   function ensureModal() {
     if (ui.backdrop) { return; }
+    if (!state.root) { state.root = ensureRoot(); }
     var root = state.root;
+    /* 仍然没有 body:静默返回,open() 不会因此抛错。 */
+    if (!root) { return; }
+
+    /* 上一次注入脚本如果中途失败,root 里可能留着一个孤儿 backdrop:先清掉。 */
+    for (var i = root.children.length - 1; i >= 0; i--) {
+      var orphan = root.children[i];
+      if (orphan && String(orphan.className).indexOf('dsuc-backdrop') !== -1) {
+        root.removeChild(orphan);
+      }
+    }
 
     var backdrop = el('div', 'dsuc-backdrop');
     backdrop.hidden = true;
@@ -662,29 +666,10 @@
   /* ------------------------------------------------------------------ *
    * Pill —— 已按需求移除
    * 左下角那个「更新中心 / N 项可更新」胶囊会和 DSH 桌面端自带的「更多」控件重叠,
-   * 所以这里不再创建任何 DOM。只保留 pillKind / pillCount 状态记录,让其余逻辑照旧;
-   * 面板本身每次启动都会自动弹出,关闭后可用 dshSkillUpdater.open() 重新打开。
+   * 所以这里不再创建任何 DOM,也不再保留任何胶囊状态。
+   * 面板本身每次启动会自动弹出一次;关闭后本次会话不再自动弹出,
+   * 需要时可用 dshSkillUpdater.open() 重新打开。
    * ------------------------------------------------------------------ */
-
-  function hidePill() {
-    if (pillEl && pillEl.parentNode) { pillEl.parentNode.removeChild(pillEl); }
-    pillEl = null;
-    pillKind = null;
-    pillCount = -1;
-  }
-
-  function showPill(kind, payload) {
-    /* 不渲染任何按钮,只记录状态。 */
-    var data = payload || {};
-    pillKind = kind;
-    if (kind === 'updates') {
-      pillCount = typeof data.count === 'number' ? data.count : countItems(state.status);
-    } else if (kind === 'none') {
-      pillCount = 0;
-    } else {
-      pillCount = -1;
-    }
-  }
 
   /* ------------------------------------------------------------------ *
    * Modal open / close
@@ -707,6 +692,8 @@
   function openModal() {
     try {
       ensureModal();
+      /* 还没有 document.body(或初始化未完成):什么都不做,绝不抛错。 */
+      if (!ui.backdrop) { return; }
       state.modalOpen = true;
       if (state.view !== 'progress' && state.view !== 'done') { state.view = 'list'; }
       ui.backdrop.hidden = false;
@@ -727,24 +714,11 @@
       state.modalOpen = false;
       document.removeEventListener('keydown', onKeyDown, true);
 
-      var st = state.status;
-      if (recordDismiss !== false && st) {
-        if (st.phase === 'error') {
-          showPill('error', { error: st.error });
-        } else if (st.phase === 'checking') {
-          showPill('checking');
-        } else {
-          var n = countItems(st);
-          var sig = signature(st);
-          state.dismissedSig = sig;
-          writeDismissed(sig);
-          if (n > 0) {
-            showPill('updates', { count: n });
-          } else {
-            /* nothing to update: the pill reopens the inventory panel */
-            showPill('none', {});
-          }
-        }
+      /* 用户主动关闭(稍后 / × / Esc / 点背景):本次会话不再自动弹出,
+       * 无论当时处于哪个阶段 —— 正处于 checking 时更要记下来。 */
+      if (recordDismiss !== false) {
+        state.closed = true;
+        writeClosed();
       }
 
       state.view = 'list';
@@ -937,12 +911,7 @@
 
     var line = el('div', 'dsuc-line');
     line.appendChild(el('span', 'dsuc-name', item.name || item.id));
-
-    var ver = el('span', 'dsuc-ver');
-    ver.appendChild(document.createTextNode(item.installed ? String(item.installed) : '?'));
-    ver.appendChild(document.createTextNode(' → '));
-    ver.appendChild(el('strong', 'dsuc-new', item.available ? String(item.available) : '?'));
-    line.appendChild(ver);
+    line.appendChild(versionSpan(item.installed, item.available));
 
     main.appendChild(line);
     if (item.note) {
@@ -1108,10 +1077,11 @@
     httpJson('POST', BASE + '/recheck').then(function () {
       return httpJson('GET', BASE + '/status.json');
     }).then(function (data) {
+      state.statusFailures = 0;
       applyStatus(data);
     }).catch(function (err) {
-      state.inlineError = friendlyError(err, '重新检查失败');
-      renderModal();
+      /* 失败也要回到可用状态:直接进入 error 阶段,「重新检查」立刻可以再点。 */
+      applyStatus({ ok: false, phase: 'error', error: friendlyError(err, '重新检查失败') });
     });
   }
 
@@ -1120,18 +1090,27 @@
     var ids = selectedIds();
     if (!ids.length) { return; }
 
+    /* httpJson 会在同步阶段调用 fetch,所以先建 promise:它抛错时不能先切到进度视图,
+     * 否则面板会卡在一个关不掉、也没有轮询的 progress 视图里。 */
+    var request;
+    try {
+      request = httpJson('POST', BASE + '/apply', { ids: ids });
+    } catch (err) {
+      state.inlineError = friendlyError(err, '应用更新失败');
+      renderModal();
+      return;
+    }
+
     state.applying = true;
     state.inlineError = null;
     state.view = 'progress';
     state.job = null;
-    state.jobId = null;
     renderModal();
 
-    httpJson('POST', BASE + '/apply', { ids: ids }).then(function (res) {
+    request.then(function (res) {
       if (!res || res.ok === false) {
         throw new Error((res && res.error) ? String(res.error) : '应用更新失败');
       }
-      state.jobId = res.jobId || null;
       startJobPolling();
     }).catch(function (err) {
       state.applying = false;
@@ -1145,7 +1124,18 @@
     stopJobPolling();
     state.jobPolls = 0;
     pollJob();
-    state.jobTimer = setInterval(function () { pollJob(); }, POLL_MS);
+    state.jobTimer = setInterval(function () {
+      try {
+        pollJob();
+      } catch (err) {
+        /* 同步抛错(例如 fetch 不可用)也必须把面板放回可用状态。 */
+        stopJobPolling();
+        state.applying = false;
+        state.view = 'list';
+        state.inlineError = friendlyError(err, '读取更新进度失败');
+        renderModal();
+      }
+    }, POLL_MS);
   }
 
   function stopJobPolling() {
@@ -1221,24 +1211,31 @@
    * Status loading & polling
    * ------------------------------------------------------------------ */
 
-  function giveUpStatusPolling() {
-    stopStatusPolling();
-    if (!state.modalOpen) { hidePill(); }
-  }
-
+  /* 宿主检查更新要走网络,可能长时间停在 checking(10s+ 甚至更久),
+   * 所以「成功返回 checking」不计入上限;只有连续请求失败才计数。
+   * 另外用 10 分钟看门狗兜底「宿主永远停在 checking」。
+   * 无论哪条路径触发,都会落到可见的 error 状态,绝不静默停止轮询。 */
   function statusTick() {
-    state.statusPolls++;
-    if (state.statusPolls > MAX_STATUS_POLLS) { giveUpStatusPolling(); return; }
+    if (state.statusSince && (Date.now() - state.statusSince) > STATUS_WATCHDOG_MS) {
+      tripStatusError('检查更新耗时过长（超过 10 分钟），已停止自动刷新。可点「重新检查」重试。');
+      return;
+    }
     httpJson('GET', BASE + '/status.json').then(function (data) {
+      state.statusFailures = 0;
       applyStatus(data);
-    }).catch(function () {
-      if (state.statusPolls > MAX_STATUS_POLLS) { giveUpStatusPolling(); }
+    }).catch(function (err) {
+      state.statusFailures++;
+      if (state.statusFailures >= MAX_STATUS_FAILURES) {
+        tripStatusError(friendlyError(err, '检查更新失败') +
+          '（已连续失败 ' + state.statusFailures + ' 次，已停止自动刷新）');
+      }
     });
   }
 
   function startStatusPolling() {
     if (state.statusTimer) { return; }
-    state.statusPolls = 0;
+    state.statusFailures = 0;
+    state.statusSince = Date.now();
     state.statusTimer = setInterval(function () { safely(statusTick)(); }, POLL_MS);
   }
 
@@ -1247,7 +1244,13 @@
       clearInterval(state.statusTimer);
       state.statusTimer = null;
     }
-    state.statusPolls = 0;
+    state.statusFailures = 0;
+    state.statusSince = 0;
+  }
+
+  /* 轮询失败或超时后统一落到可见的 error 状态,保留 host / checkedAt 用于副标题。 */
+  function tripStatusError(message) {
+    applyStatus(Object.assign({}, state.status || {}, { ok: false, phase: 'error', error: message }));
   }
 
   /* Ready: show the update list, or — once per browser session — the full
@@ -1255,24 +1258,15 @@
    *
    * Rationale: a DSH restart / reopening the desktop client starts a fresh
    * browser session, so the panel shows once per launch; a plain F5 keeps the
-   * same sessionStorage, so it does not nag on every refresh. */
+   * same sessionStorage, so it does not nag on every refresh.
+   * 用户主动关闭过面板之后,本次会话一律不再自动弹出。 */
   function handleReady(st) {
-    var n = countItems(st);
-    var sig = signature(st);
-    var dismissed = (state.dismissedSig === sig) || (readDismissed() === sig);
-
-    if (dismissed) {
-      /* the user already closed this exact status: pill only */
-      state.dismissedSig = sig;
-      if (!state.modalOpen) { showReadyPill(n); }
-      return;
-    }
-
+    if (state.closed || readClosed()) { return; }
     if (state.modalOpen) { return; }
 
+    var n = countItems(st);
     if (n > 0) {
       writeShown();
-      hidePill();
       openModal();
       return;
     }
@@ -1280,21 +1274,21 @@
     /* Nothing to update: open the panel anyway, but only once per session. */
     if (!readShown()) {
       writeShown();
-      hidePill();
       openModal();
       return;
     }
 
     logOnce('no-updates', '[dsh-skill-updater] 当前没有可用更新。');
-    showReadyPill(0);
   }
 
-  function showReadyPill(n) {
-    if (n > 0) {
-      if (pillKind !== 'updates' || pillCount !== n) { showPill('updates', { count: n }); }
-    } else if (pillKind !== 'none') {
-      showPill('none', {});
-    }
+  /* 检查失败不能是静默的(胶囊按钮已移除,没有别的提示面):
+   * 本会话还没弹过面板、用户也没关闭过时,自动打开错误面板。 */
+  function maybeOpenError() {
+    if (state.modalOpen) { return; }
+    if (state.closed || readClosed()) { return; }
+    if (readShown()) { return; }
+    writeShown();
+    openModal();
   }
 
   function applyStatus(raw) {
@@ -1304,10 +1298,7 @@
       state.selected = {};
       seedSelection(st);
 
-      if (state.modalOpen) { hidePill(); }
-
       if (st.phase === 'checking') {
-        if (!state.modalOpen && pillKind !== 'checking') { showPill('checking'); }
         startStatusPolling();
       } else {
         stopStatusPolling();
@@ -1318,9 +1309,7 @@
       if (st.phase === 'ready') {
         handleReady(st);
       } else if (st.phase === 'error') {
-        if (!state.modalOpen && pillKind !== 'error') {
-          showPill('error', { error: st.error });
-        }
+        maybeOpenError();
       }
     } catch (err) {
       try { console.error('[dsh-skill-updater]', err); } catch (e) { /* ignore */ }
@@ -1345,22 +1334,30 @@
 
   function boot() {
     var tries = 0;
+    var started = false;
+
+    /* 初始化最终失败:清掉注入标记,让之后再注入一次脚本还能重试。 */
+    function giveUp(message) {
+      try { console.warn('[dsh-skill-updater] ' + message); } catch (e) { /* ignore */ }
+      try { window[INJECT_FLAG] = false; } catch (e) { /* ignore */ }
+    }
 
     function attempt() {
+      if (started) { return; }
       if (!document.body) {
         tries++;
         if (tries < 40) { setTimeout(attempt, 150); return; }
-        try { console.warn('[dsh-skill-updater] 未找到 document.body，已放弃初始化。'); } catch (e) { /* ignore */ }
+        giveUp('未找到 document.body，已放弃初始化。');
         return;
       }
+      started = true;
       try {
         ensureStyle();
         state.root = ensureRoot();
         ensureModal();
-        state.dismissedSig = readDismissed();
         loadStatus();
       } catch (err) {
-        try { console.warn('[dsh-skill-updater] 初始化失败：', err); } catch (e) { /* ignore */ }
+        giveUp('初始化失败：' + friendlyError(err));
       }
     }
 
